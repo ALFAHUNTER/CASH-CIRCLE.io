@@ -25,8 +25,10 @@ services:
         value: "30"           # how often to re-scan the market
       - key: KEEPALIVE
         value: "1"            # self-ping every 10 min (prevents free-tier sleep)
-      - key: DATA_DIR
-        value: /var/data      # persistent disk mount (uncomment disk block below for paid plan)
+      # DATA_DIR defaults to ./data (works on free plan, but resets on each deploy).
+      # For paid plans with a persistent disk, set DATA_DIR=/var/data and uncomment the disk block below.
+      # - key: DATA_DIR
+      #   value: /var/data
     # Uncomment for paid plans to persist positions/history across deploys:
     # disk:
     #   name: alfaview-data
