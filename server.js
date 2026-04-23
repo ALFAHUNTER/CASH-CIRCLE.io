@@ -133,6 +133,49 @@ async function fetchBarsYahoo(interval, range) {
   throw lastErr || new Error('Yahoo: all hosts failed');
 }
 
+// Kraken PAXG/USD OHLC — PAX Gold is backed 1:1 by 1oz physical gold, so its USD price
+// tracks XAU/USD. Kraken is one of the most permissive public crypto APIs — no key, no
+// strict per-IP limits, totally different infrastructure from Yahoo/CoinGecko, so even
+// when Render's IPs are banned everywhere else this still works.
+// Returns: [time(sec), open, high, low, close, vwap, volume, count]
+async function fetchBarsKraken(interval, range) {
+  // Kraken intervals are in MINUTES: 1, 5, 15, 30, 60, 240, 1440, 10080, 21600
+  const ivMin = ({ '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440 })[interval] || 1440;
+  const url = `https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=${ivMin}`;
+  const json = await httpsGetJson(url);
+  if (json.error && json.error.length) throw new Error(`kraken: ${json.error.join(',')}`);
+  // Kraken returns the result keyed under the canonical pair name (e.g. "PAXGUSD").
+  const key = Object.keys(json.result || {}).find((k) => k !== 'last');
+  const rows = key && json.result[key];
+  if (!Array.isArray(rows) || rows.length < 30) throw new Error(`kraken: only ${rows?.length || 0} candles`);
+  // Trim to the requested range (Kraken returns ~720 most-recent candles).
+  const rangeBars = ({
+    '1d': { 60: 24, 240: 6, 1440: 1 }[ivMin] || 1,
+    '5d': { 1: 5*1440, 5: 5*288, 15: 5*96, 60: 5*24, 240: 5*6, 1440: 5 }[ivMin] || 5,
+    '1mo': { 60: 30*24, 240: 30*6, 1440: 30 }[ivMin] || 30,
+    '3mo': { 60: 90*24, 240: 90*6, 1440: 90 }[ivMin] || 90,
+    '6mo': { 1440: 180 }[ivMin] || 180,
+    '1y': { 1440: 365 }[ivMin] || 365,
+    '2y': { 1440: 720 }[ivMin] || 720,
+  })[range] || 90;
+  const trimmed = rows.slice(-Math.max(60, rangeBars));
+  // Scale PAXG → real gold spot using live spot price (small premium/discount exists).
+  let scale = 1;
+  try {
+    const spot = await fetchLiveSpotXau();
+    const lastPaxg = parseFloat(trimmed[trimmed.length - 1][4]);
+    if (spot && lastPaxg && isFinite(spot) && isFinite(lastPaxg)) scale = spot / lastPaxg;
+  } catch { /* keep scale = 1 */ }
+  const candles = trimmed.map((r) => ({
+    t: r[0],
+    open:  parseFloat(r[1]) * scale,
+    high:  parseFloat(r[2]) * scale,
+    low:   parseFloat(r[3]) * scale,
+    close: parseFloat(r[4]) * scale,
+  }));
+  return { candles, meta: { source: 'kraken-paxg', scale, interval: ivMin } };
+}
+
 // CoinGecko PAXG OHLC — PAX Gold is backed 1:1 by 1oz physical gold, so its USD price
 // closely tracks XAU/USD. Free, no key, very generous rate limits, and uses Cloudflare
 // (totally separate IP pool from Yahoo so Render's rate-limit doesn't apply).
@@ -269,6 +312,19 @@ async function fetchBars(interval, range) {
   } catch (e) {
     lastErr = new Error(`yahoo: ${e.message}`);
   }
+  // Kraken PAXG fallback — most permissive public crypto API, basically never rate-limits.
+  try {
+    const k = await fetchBarsKraken(interval, range);
+    if (k.candles && k.candles.length >= 30) {
+      barsCache.set(cacheKey, { data: k, expiresAt: Date.now() + ttl });
+      lastBarSource = 'kraken-paxg';
+      lastSourceError = lastErr.message;
+      return k;
+    }
+    lastErr = new Error(`${lastErr.message}; kraken: only ${k.candles?.length || 0} candles`);
+  } catch (e) {
+    lastErr = new Error(`${lastErr.message}; kraken: ${e.message}`);
+  }
   // CoinGecko PAXG fallback — totally different IP pool from Yahoo, no key, no rate-limit
   // problems on Render. Returns daily-equivalent candles scaled to live gold spot.
   try {
@@ -309,7 +365,7 @@ async function fetchXauMultiTF() {
   const dailySource = (daily.meta && daily.meta.source) || lastBarSource || '';
   const hourlyFailed = hourlyRaw && hourlyRaw.__failed;
   const hourlyTooShort = hourlyRaw && hourlyRaw.candles && hourlyRaw.candles.length < 60;
-  if (hourlyFailed || hourlyTooShort || dailySource.startsWith('stooq') || dailySource.startsWith('coingecko')) {
+  if (hourlyFailed || hourlyTooShort) {
     const synthCandles = synthesizeHourlyFromDaily(daily.candles.slice(-30), 6);
     hourly = { candles: synthCandles, meta: { source: 'synth-from-daily' } };
     lastBarSource = (lastBarSource || 'stooq') + '+synth-hourly';
