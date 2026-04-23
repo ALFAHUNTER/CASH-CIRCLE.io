@@ -1108,7 +1108,12 @@ api.get('/xauusd/analysis', async (_, res) => {
       if (a.tp) a.tp = a.tp + delta;
       a.priceSource = 'spot (gold-api.com)';
     } catch (e) { a.priceSource = 'futures (GC=F)'; }
-    res.json({ pair: 'XAU/USD', asOf: new Date(hourly.meta.regularMarketTime * 1000).toISOString(), ...a });
+    // hourly.meta.regularMarketTime only exists on Yahoo responses; fall back to the latest
+    // candle timestamp (or now) for non-Yahoo sources (kraken, coingecko, synthesized, stale).
+    const asOfSec = (hourly.meta && hourly.meta.regularMarketTime)
+      || (hourly.candles && hourly.candles.length && hourly.candles[hourly.candles.length - 1].t)
+      || Math.floor(Date.now() / 1000);
+    res.json({ pair: 'XAU/USD', asOf: new Date(asOfSec * 1000).toISOString(), source: lastBarSource, ...a });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 api.get('/health', (_, res) => res.json({ status: 'ok', uptime: Math.floor(process.uptime()) + 's' }));
