@@ -22,49 +22,85 @@ require('dotenv').config();
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
-// Manual URL parser: handles passwords containing # / @ / ? without breaking
-// pg's WHATWG URL parser (which throws "Invalid URL" on those characters).
-function parsePgUrl(raw) {
-  const proto = raw.match(/^(postgres(?:ql)?):\/\//i);
-  if (!proto) throw new Error('connection string must start with postgres://');
-  let rest = raw.slice(proto[0].length);
-  // Split off ?query
-  let query = '';
-  const qi = rest.indexOf('?');
-  if (qi >= 0) { query = rest.slice(qi + 1); rest = rest.slice(0, qi); }
-  // Split off /database (use LAST slash so paths can't contain it)
-  let database = '';
-  const si = rest.indexOf('/');
-  if (si >= 0) { database = rest.slice(si + 1); rest = rest.slice(0, si); }
-  // Split user:pass @ host:port — use LAST '@' so '@' inside password is OK
-  const ai = rest.lastIndexOf('@');
-  let userinfo = '', hostport = rest;
-  if (ai >= 0) { userinfo = rest.slice(0, ai); hostport = rest.slice(ai + 1); }
-  let user = '', password = '';
-  const ci = userinfo.indexOf(':');
-  if (ci >= 0) { user = userinfo.slice(0, ci); password = userinfo.slice(ci + 1); }
-  else { user = userinfo; }
-  const [host, port] = hostport.split(':');
-  const params = new URLSearchParams(query);
-  const tryDecode = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
-  return {
-    user: tryDecode(user),
-    password: password ? tryDecode(password) : undefined,
-    host,
-    port: port ? Number(port) : 5432,
-    database: database ? tryDecode(database) : undefined,
-    ssl: (params.get('sslmode') || '').toLowerCase() === 'disable' ? false : { rejectUnauthorized: false },
+// Use pg's own connection-string parser (already a transitive dep of `pg`).
+// This handles every libpq URL form Neon/Render emit, including
+// `postgres://user/db?host=...&password=...` style query-param URLs and
+// passwords containing special characters that break a naive parser.
+//
+// IMPORTANT EDGE CASE: `postgres://NEONDB_OWNER/neondb?host=ep-xxx.neon.tech&password=...`
+// pg-connection-string treats `NEONDB_OWNER` as the host, then the `?host=`
+// query param overrides it — silently losing the username. We detect this case
+// (no `@` in authority + `host=` in query) and recover the user from the
+// position pgcs misread as host.
+function buildPgConfig(raw) {
+  const pgcs = require('pg-connection-string');
+  const c = pgcs.parse(raw);
+
+  // Build query-param fallback map.
+  let qp = {};
+  const qi = raw.indexOf('?');
+  if (qi >= 0) qp = Object.fromEntries(new URLSearchParams(raw.slice(qi + 1)));
+
+  // Reparse the authority manually using Node's URL (after rewriting the
+  // protocol so URL() accepts credentials). This lets us recover the user
+  // when pgcs lost it to the host slot.
+  let urlUser, urlPassword, urlHostname, urlPort;
+  try {
+    const u = new URL(raw.replace(/^postgres(ql)?:/, 'http:'));
+    if (u.username) urlUser     = decodeURIComponent(u.username);
+    if (u.password) urlPassword = decodeURIComponent(u.password);
+    if (u.hostname) urlHostname = u.hostname;
+    if (u.port)     urlPort     = u.port;
+  } catch { /* malformed URL — fall back to pgcs only */ }
+
+  // libpq form recovery: if there's no `user@` in the URL but a `host=` query
+  // param IS present, then `urlHostname` is actually the username.
+  if (!urlUser && urlHostname && (qp.host || qp.hostaddr)) {
+    urlUser = urlHostname;
+    urlHostname = undefined;
+  }
+
+  // pick: first non-empty value wins (treat "" as missing).
+  const pick = (...vals) => {
+    for (const v of vals) if (v != null && v !== '') return v;
+    return undefined;
   };
+
+  // Coerce ssl: disable only if explicit, otherwise tolerate self-signed (Neon).
+  let ssl;
+  if (c.ssl === false || /sslmode=disable/i.test(raw)) ssl = false;
+  else ssl = { rejectUnauthorized: false };
+
+  return {
+    user:     pick(c.user,     urlUser,     qp.user),
+    password: pick(c.password, urlPassword, qp.password),
+    host:     pick(qp.host,    qp.hostaddr, c.host, urlHostname),
+    port:     Number(pick(c.port, qp.port, urlPort, 5432)),
+    database: pick(c.database, qp.dbname,  qp.database),
+    ssl,
+  };
+}
+
+// Redact a connection string for safe logging.
+function redactPgUrl(raw) {
+  return String(raw)
+    .replace(/(:\/\/[^:@\/?]+:)[^@\/?]+(@)/, '$1***$2')        // scheme://user:PASS@
+    .replace(/([?&]password=)[^&]+/i, '$1***')                  // ?password=PASS
+    .replace(/([?&]auth_token=)[^&]+/i, '$1***');
 }
 
 const HAS_DB = !!process.env.ALFA_DATABASE_URL;
 let pool = null;
 if (HAS_DB) {
   try {
-    const cfg = parsePgUrl(process.env.ALFA_DATABASE_URL);
+    const cfg = buildPgConfig(process.env.ALFA_DATABASE_URL);
+    if (!cfg.host)     throw new Error(`no host parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
+    if (!cfg.user)     throw new Error(`no user parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
+    if (!cfg.password) console.warn('[db] WARNING: no password parsed (relying on PGPASSWORD env or trust auth)');
+    if (!cfg.database) throw new Error(`no database parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
     pool = new Pool({ ...cfg, max: 5, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 });
     pool.on('error', (e) => console.error('[db] pool error:', e.message));
-    console.log(`[db] connected via ALFA_DATABASE_URL → ${cfg.host}/${cfg.database}`);
+    console.log(`[db] connected via ALFA_DATABASE_URL → ${cfg.user}@${cfg.host}:${cfg.port}/${cfg.database}`);
   } catch (e) {
     console.error('[db] FAILED to parse ALFA_DATABASE_URL:', e.message);
     pool = null;
