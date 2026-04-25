@@ -22,6 +22,27 @@ require('dotenv').config();
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
+// Sanitize a connection string before parsing. Handles the common ways
+// users accidentally mangle it when pasting into Render/dashboard env vars:
+//   - whole `psql '...'` command copied from Neon's "Connect" panel
+//   - wrapped in single or double quotes
+//   - leading/trailing whitespace or newlines
+//   - missing scheme (just `user:pw@host/db`)
+function sanitizeDbUrl(raw) {
+  let s = String(raw || '').trim();
+  // Strip a leading `psql ` (with optional flags like -d/--dbname) prefix.
+  s = s.replace(/^psql\s+(?:-d\s+|--dbname[= ])?/i, '').trim();
+  // Strip surrounding quotes (single, double, or backticks).
+  if ((s.startsWith('"') && s.endsWith('"')) ||
+      (s.startsWith("'") && s.endsWith("'")) ||
+      (s.startsWith('`') && s.endsWith('`'))) {
+    s = s.slice(1, -1).trim();
+  }
+  // If no scheme is present, assume postgres://
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'postgres://' + s;
+  return s;
+}
+
 // Use pg's own connection-string parser (already a transitive dep of `pg`).
 // This handles every libpq URL form Neon/Render emit, including
 // `postgres://user/db?host=...&password=...` style query-param URLs and
@@ -32,14 +53,26 @@ const crypto = require('crypto');
 // query param overrides it — silently losing the username. We detect this case
 // (no `@` in authority + `host=` in query) and recover the user from the
 // position pgcs misread as host.
-function buildPgConfig(raw) {
+function buildPgConfig(rawInput) {
   const pgcs = require('pg-connection-string');
-  const c = pgcs.parse(raw);
+  const raw = sanitizeDbUrl(rawInput);
+
+  // Try pg-connection-string first; if it throws, fall back to URL-only parse.
+  let c = {};
+  try { c = pgcs.parse(raw); }
+  catch (e) {
+    // Don't throw yet — let the URL fallback below try to recover something
+    // useful. We'll throw a helpful error at the end if nothing parses.
+    c = {};
+  }
 
   // Build query-param fallback map.
   let qp = {};
   const qi = raw.indexOf('?');
-  if (qi >= 0) qp = Object.fromEntries(new URLSearchParams(raw.slice(qi + 1)));
+  if (qi >= 0) {
+    try { qp = Object.fromEntries(new URLSearchParams(raw.slice(qi + 1))); }
+    catch { qp = {}; }
+  }
 
   // Reparse the authority manually using Node's URL (after rewriting the
   // protocol so URL() accepts credentials). This lets us recover the user
@@ -92,17 +125,40 @@ function redactPgUrl(raw) {
 const HAS_DB = !!process.env.ALFA_DATABASE_URL;
 let pool = null;
 if (HAS_DB) {
+  const rawUrl = process.env.ALFA_DATABASE_URL;
+  // Diagnostic: log a redacted shape of what we received from the env. Helps
+  // distinguish "env var has the psql command" / "wrapped in quotes" / "truncated"
+  // / "missing scheme" cases without ever exposing credentials.
+  const trimmed = String(rawUrl).trim();
+  const shape =
+    `len=${trimmed.length} ` +
+    `firstChar=${JSON.stringify(trimmed[0] || '')} ` +
+    `lastChar=${JSON.stringify(trimmed[trimmed.length - 1] || '')} ` +
+    `scheme=${(trimmed.match(/^[a-z][a-z0-9+.-]*:\/\//i) || ['(none)'])[0]} ` +
+    `hasAt=${trimmed.includes('@')} ` +
+    `hasQuery=${trimmed.includes('?')} ` +
+    `looksQuoted=${/^['"`].*['"`]$/.test(trimmed)} ` +
+    `looksLikePsql=${/^psql\s/i.test(trimmed)}`;
+  console.log(`[db] ALFA_DATABASE_URL shape: ${shape}`);
+  console.log(`[db] ALFA_DATABASE_URL redacted: ${redactPgUrl(rawUrl)}`);
+
   try {
-    const cfg = buildPgConfig(process.env.ALFA_DATABASE_URL);
-    if (!cfg.host)     throw new Error(`no host parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
-    if (!cfg.user)     throw new Error(`no user parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
+    const cfg = buildPgConfig(rawUrl);
+    if (!cfg.host)     throw new Error(`no host parsed from ${redactPgUrl(rawUrl)}`);
+    if (!cfg.user)     throw new Error(`no user parsed from ${redactPgUrl(rawUrl)}`);
     if (!cfg.password) console.warn('[db] WARNING: no password parsed (relying on PGPASSWORD env or trust auth)');
-    if (!cfg.database) throw new Error(`no database parsed from ${redactPgUrl(process.env.ALFA_DATABASE_URL)}`);
+    if (!cfg.database) throw new Error(`no database parsed from ${redactPgUrl(rawUrl)}`);
     pool = new Pool({ ...cfg, max: 5, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 });
     pool.on('error', (e) => console.error('[db] pool error:', e.message));
     console.log(`[db] connected via ALFA_DATABASE_URL → ${cfg.user}@${cfg.host}:${cfg.port}/${cfg.database}`);
   } catch (e) {
     console.error('[db] FAILED to parse ALFA_DATABASE_URL:', e.message);
+    console.error('[db] Common causes:');
+    console.error('       (1) you pasted the full `psql \'...\'` command instead of just the URL');
+    console.error('       (2) the value is wrapped in extra quotes');
+    console.error('       (3) the scheme `postgres://` is missing');
+    console.error('       (4) the value was truncated when pasted into Render');
+    console.error('       Expected form: postgres://USER:PASSWORD@HOST/DB?sslmode=require');
     pool = null;
   }
 } else {
