@@ -1146,6 +1146,22 @@ function swingLevels(candles, lookback = 20) {
   }
   return { swingHigh: hi, swingLow: lo };
 }
+// Shared trade-sizing helper. Mutates `a` (an analyzer result) in place to
+// apply the user's slMultiplier (tighter or wider SL) and rrRatio (TP relative
+// to SL distance). Used by BOTH the auto-trader and the dashboard analysis
+// preview so what the user sees on screen is exactly what would be opened.
+// Floors the SL at max(0.4× ATR, $0.50) so it can never sit inside tick noise.
+function applyTradeSizing(a, s) {
+  if (!a || !a.direction || !a.entry || !a.sl || !a.tp) return a;
+  const engineSlDist = Math.abs(a.entry - a.sl);
+  const minSlDist = Math.max(0.5, (a.atr || 5) * 0.4);
+  const targetSlDist = Math.max(minSlDist, engineSlDist * (s.slMultiplier || 1));
+  const rr = s.rrRatio || 1.5;
+  a.sl = a.direction === 'BUY' ? a.entry - targetSlDist : a.entry + targetSlDist;
+  a.tp = a.direction === 'BUY' ? a.entry + targetSlDist * rr : a.entry - targetSlDist * rr;
+  return a;
+}
+
 function analyzeMarketHQ(daily, hourly, opts = {}) {
   const dC = daily.map((c) => c.close);
   const dE20 = ema(dC, 20), dE50 = ema(dC, 50);
@@ -1301,6 +1317,7 @@ function loadSettings() {
       apply('minConfidence', 0, 100);
       apply('rrRatio', 0.1, 10);
       apply('slMultiplier', 0.1, 10);
+      apply('maxTradeMinutes', 0, 1440);
       apply('cooldownSec', 0, 86400);
       apply('maxOpenPositions', 1, 10);
       apply('huntFloorConfidence', 40, 95);
@@ -1468,6 +1485,19 @@ async function checkOpenPositions() {
     } else {
       if (price <= pos.tp) hit = 'TP'; else if (price >= pos.sl) hit = 'SL';
     }
+    // ---- Time-based exit -------------------------------------------------
+    // Force-close positions that have been open longer than maxTradeMinutes.
+    // Whatever side is in profit (or break-even) at the timeout is recorded
+    // as TP, otherwise SL — keeps stats honest and frees up the slot for the
+    // next setup instead of letting a stale signal drag for hours.
+    if (!hit && settings.maxTradeMinutes > 0 && pos.openedAt) {
+      const ageMs = Date.now() - new Date(pos.openedAt).getTime();
+      if (ageMs >= settings.maxTradeMinutes * 60_000) {
+        const livePnl = pos.direction === 'BUY' ? price - pos.entry : pos.entry - price;
+        hit = livePnl >= 0 ? 'TP' : 'SL';
+        console.log(`[tracker] time-exit on #${id} after ${Math.round(ageMs/60000)}min @ ${price} (${hit})`);
+      }
+    }
     if (!hit) continue;
     openPositions.delete(id); saveState();
     recordClosed({ ...pos, id }, price, hit);
@@ -1544,8 +1574,16 @@ const AUTO_INTERVAL = Math.max(5, Number(process.env.AUTO_INTERVAL_SEC) || 60) *
 const settings = {
   // Quality-first defaults: only fire on A-grade setups, one position at a time.
   minConfidence: Math.max(40, Math.min(100, Number(process.env.MIN_CONFIDENCE) || 75)),
-  rrRatio: Math.max(0.5, Math.min(10, Number(process.env.RR_RATIO) || 2)),
-  slMultiplier: Math.max(0.5, Math.min(5, Number(process.env.SL_MULTIPLIER) || 1.5)),
+  // Tightened for fast in-and-out trades. Old defaults (rr=2, sl=1.5) produced
+  // SL ~1.5×ATR / TP ~3×ATR which on XAU/USD often took hours to resolve.
+  // New defaults give SL ≈ 0.7× engine distance and TP at 1.5×SL → trades
+  // typically end inside 5–30 min instead of dragging on.
+  rrRatio: Math.max(0.5, Math.min(10, Number(process.env.RR_RATIO) || 1.5)),
+  slMultiplier: Math.max(0.3, Math.min(5, Number(process.env.SL_MULTIPLIER) || 0.7)),
+  // Hard time cap on any single trade. 0 = disabled. When >0, the position
+  // monitor force-closes any trade older than this at the live spot price so
+  // no signal stays open for hours waiting for TP/SL to print.
+  maxTradeMinutes: Math.max(0, Math.min(1440, Number(process.env.MAX_TRADE_MIN) || 30)),
   cooldownSec: Math.max(0, Math.min(86400, Number(process.env.COOLDOWN_SEC) || 0)),
   maxOpenPositions: Math.max(1, Math.min(10, Number(process.env.MAX_OPEN_POSITIONS) || 1)),
   // Hunt mode OFF by default — was firing too many marginal trades.
@@ -1651,10 +1689,8 @@ async function runAutoSignal() {
       const delta = spot - a.entry;
       a.entry = spot; a.sl = a.sl + delta; a.tp = a.tp + delta;
     } catch (e) { console.warn('[auto] spot anchor skipped:', e.message); }
-    if (settings.rrRatio && settings.rrRatio !== 2) {
-      const slDist = Math.abs(a.entry - a.sl);
-      a.tp = a.direction === 'BUY' ? a.entry + slDist * settings.rrRatio : a.entry - slDist * settings.rrRatio;
-    }
+    // Apply slMultiplier + rrRatio so trades are tight and quick.
+    applyTradeSizing(a, settings);
     const id = ++positionCounter;
     openPositions.set(id, { pair: 'XAU/USD', direction: a.direction, entry: a.entry, sl: a.sl, tp: a.tp, atr: a.atr, breakevenMoved: false, fallback: isFallback, openedAt: new Date().toISOString() });
     saveState();
@@ -1737,6 +1773,7 @@ api.post('/settings', (req, res) => {
   if (b.minConfidence != null) settings.minConfidence = Math.max(0, Math.min(100, +b.minConfidence));
   if (b.rrRatio != null) settings.rrRatio = Math.max(0.1, Math.min(10, +b.rrRatio));
   if (b.slMultiplier != null) settings.slMultiplier = Math.max(0.1, Math.min(10, +b.slMultiplier));
+  if (b.maxTradeMinutes != null) settings.maxTradeMinutes = Math.max(0, Math.min(1440, +b.maxTradeMinutes));
   if (b.cooldownSec != null) settings.cooldownSec = Math.max(0, Math.min(86400, +b.cooldownSec));
   if (b.maxOpenPositions != null) settings.maxOpenPositions = Math.max(1, Math.min(10, +b.maxOpenPositions));
   if (b.huntModeEnabled != null) settings.huntModeEnabled = !!b.huntModeEnabled;
@@ -1763,8 +1800,9 @@ api.post('/settings/reset', (_, res) => {
   // Match the main `const settings = {…}` defaults at the top of this file so
   // a reset truly restores the documented defaults instead of a stricter mix.
   settings.minConfidence    = Math.max(40, Math.min(100, Number(process.env.MIN_CONFIDENCE)    || 75));
-  settings.rrRatio          = Math.max(0.5, Math.min(10, Number(process.env.RR_RATIO)          || 2));
-  settings.slMultiplier     = Math.max(0.5, Math.min(5,  Number(process.env.SL_MULTIPLIER)     || 1.5));
+  settings.rrRatio          = Math.max(0.5, Math.min(10, Number(process.env.RR_RATIO)          || 1.5));
+  settings.slMultiplier     = Math.max(0.3, Math.min(5,  Number(process.env.SL_MULTIPLIER)     || 0.7));
+  settings.maxTradeMinutes  = Math.max(0,  Math.min(1440, Number(process.env.MAX_TRADE_MIN)    || 30));
   settings.cooldownSec      = Math.max(0,  Math.min(86400, Number(process.env.COOLDOWN_SEC)    || 0));
   settings.maxOpenPositions = Math.max(1,  Math.min(10, Number(process.env.MAX_OPEN_POSITIONS) || 1));
   // Mirror the reset to disk + DB so the next restart actually picks them up.
@@ -1826,6 +1864,12 @@ api.get('/xauusd/analysis', async (_, res) => {
       if (a.tp) a.tp = a.tp + delta;
       a.priceSource = 'spot (gold-api.com)';
     } catch (e) { a.priceSource = 'futures (GC=F)'; }
+    // Apply the same sizing the auto-trader uses so the dashboard preview
+    // matches what would actually be opened. Skipped when confidence is 0
+    // (engine returned a no-trade verdict — leave SL/TP untouched).
+    if (a.confidence > 0 && a.sl && a.tp && a.direction) {
+      applyTradeSizing(a, settings);
+    }
     // hourly.meta.regularMarketTime only exists on Yahoo responses; fall back to the latest
     // candle timestamp (or now) for non-Yahoo sources (kraken, coingecko, synthesized, stale).
     const asOfSec = (hourly.meta && hourly.meta.regularMarketTime)
