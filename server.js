@@ -1262,9 +1262,32 @@ function analyzeMarketHQ(daily, hourly, opts = {}) {
     reasons, riskLabel };
 }
 
+// XAU/USD spot trading hours (ET). Opens Sunday 17:00 ET, closes Friday 17:00 ET.
+// Outside these hours, the upstream price source returns the last close (stuck),
+// which used to silently produce "TP HIT" results at exit==entry with $0 profit.
+function isMarketOpen(now = new Date()) {
+  // Convert "now" into a wall-clock object in America/New_York.
+  const nyParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', hour12: false,
+  }).formatToParts(now);
+  const wd = nyParts.find((p) => p.type === 'weekday').value; // Sun, Mon, ...
+  const hr = Number(nyParts.find((p) => p.type === 'hour').value);
+  // Friday after 17:00 → closed. Saturday all day → closed. Sunday before 17:00 → closed.
+  if (wd === 'Sat') return false;
+  if (wd === 'Fri' && hr >= 17) return false;
+  if (wd === 'Sun' && hr < 17) return false;
+  return true;
+}
+
 // Live spot XAU/USD price source — gold-api.com (free, no key, matches OANDA/TradingView spot).
 // Cached 5s to avoid hammering the upstream while still feeling realtime in the UI.
+// Stale-price guard: if the upstream returns the exact same price for >2 min,
+// treat the feed as stuck (typical on weekends/holidays) and reject — callers
+// must not open or close trades against a frozen tape.
 let _spotCache = { at: 0, price: null };
+let _spotStableSince = 0;
+let _spotStableValue = null;
+const SPOT_STALE_MS = 120_000;
 function fetchSpotXau() {
   return new Promise((resolve, reject) => {
     if (_spotCache.price && Date.now() - _spotCache.at < 5000) return resolve(_spotCache.price);
@@ -1275,6 +1298,15 @@ function fetchSpotXau() {
           const j = JSON.parse(data);
           const p = Number(j.price);
           if (!isFinite(p) || p <= 0) return reject(new Error('Invalid spot price'));
+          // Track how long the upstream has been stuck on the same value.
+          if (_spotStableValue === p) {
+            if (Date.now() - _spotStableSince >= SPOT_STALE_MS) {
+              return reject(new Error('stale spot feed (upstream frozen — market likely closed)'));
+            }
+          } else {
+            _spotStableValue = p;
+            _spotStableSince = Date.now();
+          }
           _spotCache = { at: Date.now(), price: p };
           resolve(p);
         } catch (e) { reject(e); }
@@ -1490,9 +1522,14 @@ async function checkOpenPositions() {
     // Whatever side is in profit (or break-even) at the timeout is recorded
     // as TP, otherwise SL — keeps stats honest and frees up the slot for the
     // next setup instead of letting a stale signal drag for hours.
-    if (!hit && settings.maxTradeMinutes > 0 && pos.openedAt) {
+    //
+    // Skips entirely when the market is closed (weekends): the spot feed is
+    // frozen and any "exit" would equal the entry, producing fake $0 trades.
+    // Also skips when price hasn't moved AT ALL since open — same root cause.
+    if (!hit && settings.maxTradeMinutes > 0 && pos.openedAt && isMarketOpen()) {
       const ageMs = Date.now() - new Date(pos.openedAt).getTime();
-      if (ageMs >= settings.maxTradeMinutes * 60_000) {
+      const moved = Math.abs(price - pos.entry) > 0.01;
+      if (ageMs >= settings.maxTradeMinutes * 60_000 && moved) {
         const livePnl = pos.direction === 'BUY' ? price - pos.entry : pos.entry - price;
         hit = livePnl >= 0 ? 'TP' : 'SL';
         console.log(`[tracker] time-exit on #${id} after ${Math.round(ageMs/60000)}min @ ${price} (${hit})`);
@@ -1616,6 +1653,12 @@ async function runAutoSignal() {
   if (!autoEnabled) return;
   lastAutoRun = new Date().toISOString();
   try {
+    // Market-hours gate — XAU/USD is closed on weekends. Generating signals
+    // against a frozen tape produces fake "TP HIT" trades at exit==entry.
+    if (!isMarketOpen()) {
+      lastAutoResult = 'market closed (weekend) — no signals until Sunday 17:00 ET';
+      return;
+    }
     // Position gate — only one (or N) trade in flight at a time.
     // As soon as TP/SL closes the position, the next scan is free to fire.
     if (openPositions.size >= settings.maxOpenPositions) {
@@ -1731,6 +1774,7 @@ const api = express.Router();
 
 api.get('/auto', (_, res) => res.json({
   enabled: autoEnabled, intervalMinutes: AUTO_INTERVAL / 60000,
+  marketOpen: isMarketOpen(),
   minConfidence: settings.minConfidence, rrRatio: settings.rrRatio,
   slMultiplier: settings.slMultiplier, cooldownSec: settings.cooldownSec,
   lastRun: lastAutoRun, lastResult: lastAutoResult, openPositions: openPositions.size,
@@ -2069,6 +2113,98 @@ app.use('/__alfa', api);
 // payload instead of falling through to index.html.
 app.use(['/api', '/__alfa'], (_, res) => res.status(404).json({ error: 'not found' }));
 
+// Market-closed banner injected into every served HTML page. Polls /api/auto
+// and only shows when marketOpen=false, so it disappears automatically as soon
+// as the gold market reopens (Sunday 17:00 ET).
+const MARKET_BANNER = `
+<style>
+#alfa-market-banner{position:fixed;top:0;left:0;right:0;z-index:2147483647;
+  background:linear-gradient(90deg,#7c2d12 0%,#b91c1c 50%,#7c2d12 100%);
+  color:#fff;font:600 13px -apple-system,BlinkMacSystemFont,sans-serif;
+  padding:10px 16px;text-align:center;letter-spacing:.3px;
+  box-shadow:0 2px 12px rgba(0,0,0,.4);display:none}
+#alfa-market-banner b{font-weight:800;margin-right:6px}
+#alfa-market-banner .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:#fca5a5;margin-right:8px;vertical-align:middle;
+  animation:alfaPulse 1.6s ease-in-out infinite}
+@keyframes alfaPulse{0%,100%{opacity:1}50%{opacity:.35}}
+body.alfa-market-closed{padding-top:42px!important;
+  transition:padding-top .15s ease}
+</style>
+<div id="alfa-market-banner" role="status" aria-live="polite">
+  <span class="dot"></span><b>MARKET CLOSED</b>
+  <span id="alfa-market-msg">XAU/USD is closed for the weekend. Auto-signals paused.</span>
+</div>
+<script>(function(){
+  var el=document.getElementById('alfa-market-banner');
+  var msg=document.getElementById('alfa-market-msg');
+  // Compute the next Sunday 17:00 America/New_York instant, then format it
+  // both in ET and IST so the user sees their local-ish reopen time.
+  function nextOpenInstant(){
+    var now=new Date();
+    for(var add=0;add<8;add++){
+      var probe=new Date(now.getTime()+add*86400000);
+      // Set to 17:00 ET on this calendar day by binary-searching the UTC
+      // instant that, when formatted in NY, reads "<wd> 17:00".
+      var target=findEtInstant(probe,17,0);
+      if(target.getUTCDay()===0 /* Sun in UTC after roll? use NY weekday */){}
+      var nyParts=fmtNY(target);
+      if(nyParts.wd==='Sun'&&nyParts.hr===17&&nyParts.min===0&&target.getTime()>now.getTime()){
+        return target;
+      }
+    }
+    return null;
+  }
+  function fmtNY(d){
+    var p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',weekday:'short',hour:'numeric',minute:'2-digit',hour12:false}).formatToParts(d);
+    var get=function(t){return (p.find(function(x){return x.type===t})||{}).value};
+    return {wd:get('weekday'),hr:Number(get('hour'))%24,min:Number(get('minute'))};
+  }
+  function findEtInstant(dayHint,h,m){
+    // Binary search a UTC instant on/around dayHint that reads h:m in NY.
+    var lo=new Date(Date.UTC(dayHint.getUTCFullYear(),dayHint.getUTCMonth(),dayHint.getUTCDate(),0,0,0));
+    var hi=new Date(lo.getTime()+36*3600*1000);
+    for(var i=0;i<40;i++){
+      var mid=new Date((lo.getTime()+hi.getTime())/2);
+      var ny=fmtNY(mid);
+      var midMins=ny.hr*60+ny.min;
+      var targetMins=h*60+m;
+      if(midMins<targetMins) lo=mid; else hi=mid;
+      if(hi.getTime()-lo.getTime()<30000) break;
+    }
+    return hi;
+  }
+  function fmt(d,tz,label){
+    var s=new Intl.DateTimeFormat('en-US',{timeZone:tz,weekday:'short',hour:'numeric',minute:'2-digit',hour12:true}).format(d);
+    return s+' '+label;
+  }
+  function reopenLine(){
+    var t=nextOpenInstant();
+    if(!t) return 'Auto-signals paused.';
+    return 'Reopens '+fmt(t,'America/New_York','ET')+' / '+fmt(t,'Asia/Kolkata','IST')+'.';
+  }
+  function tick(){
+    fetch('/api/auto',{cache:'no-store'}).then(function(r){return r.json()}).then(function(a){
+      if(a&&a.marketOpen===false){
+        el.style.display='block';
+        document.body.classList.add('alfa-market-closed');
+        msg.textContent='XAU/USD is closed. '+reopenLine();
+      }else{
+        el.style.display='none';
+        document.body.classList.remove('alfa-market-closed');
+      }
+    }).catch(function(){});
+  }
+  tick();setInterval(tick,15000);
+})();</script>
+`;
+function injectBanner(html) {
+  if (typeof html !== 'string') return html;
+  if (html.indexOf('id="alfa-market-banner"') !== -1) return html; // already injected
+  if (html.indexOf('</body>') !== -1) return html.replace('</body>', MARKET_BANNER + '</body>');
+  return html + MARKET_BANNER;
+}
+
 // Serve bundled frontend (assets embedded as base64 at top of file)
   const HAS_FRONTEND = !!BUNDLED_PUBLIC['/index.html'];
   if (HAS_FRONTEND) {
@@ -2086,20 +2222,23 @@ app.use(['/api', '/__alfa'], (_, res) => res.status(404).json({ error: 'not foun
       }
       res.setHeader('Content-Type', entry.ct);
       res.setHeader('Cache-Control', key.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache');
-      res.send(Buffer.from(entry.data, 'base64'));
+      const isHtml = (entry.ct || '').indexOf('text/html') === 0;
+      const body = isHtml ? Buffer.from(injectBanner(Buffer.from(entry.data, 'base64').toString('utf8')), 'utf8')
+                          : Buffer.from(entry.data, 'base64');
+      res.send(body);
     });
     app.get('*', (req, res, next) => {
       if (req.path.startsWith('/api/') || req.path.startsWith('/__alfa/')) return next();
       const idx = BUNDLED_PUBLIC['/index.html'];
       res.setHeader('Content-Type', idx.ct);
       res.setHeader('Cache-Control', 'no-cache');
-      res.send(Buffer.from(idx.data, 'base64'));
+      res.send(Buffer.from(injectBanner(Buffer.from(idx.data, 'base64').toString('utf8')), 'utf8'));
     });
   } else {
   // Built-in fallback status page when only server.js was deployed
   app.get('/', (_, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Alfaview</title>
+    res.send(injectBanner(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Alfaview</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0b0f17;color:#e8ecf3;padding:24px;max-width:680px;margin:0 auto}
 .card{background:#131826;border:1px solid #233047;border-radius:12px;padding:20px;margin-bottom:16px}
 h1{margin:0 0 4px}.sub{color:#8a96ad;font-size:14px;margin-bottom:18px}
@@ -2152,7 +2291,7 @@ async function testTg(){
   catch(e){out.textContent='Error: '+e.message;}
 }
 refresh();setInterval(refresh,5000);
-</script></body></html>`);
+</script></body></html>`));
   });
   // 404 anything else (no SPA fallback)
   app.use((_, res) => res.status(404).json({ error: 'not found' }));
