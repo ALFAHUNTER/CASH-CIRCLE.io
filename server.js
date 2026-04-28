@@ -309,6 +309,7 @@ async function ensureSchema() {
       );
     `);
     await dbq(`CREATE INDEX IF NOT EXISTS market_news_published_idx ON market_news(pair, published_at DESC)`);
+    await dbq(`ALTER TABLE market_news ADD COLUMN IF NOT EXISTS broadcast_at TIMESTAMPTZ`);
 
     dbBootstrapped = true;
     console.log('[db] schema OK (users, sessions, subscriptions, app_settings, positions, trade_history, monthly_summaries, market_news)');
@@ -631,6 +632,48 @@ async function dbRecentNews(limit = 20) {
     source: x.source, title: x.headline, url: x.url,
     publishedAt: x.published_at.toISOString(), impact: x.impact || 'low',
   }));
+}
+
+// Broadcast newly-arrived HIGH-impact headlines to Telegram. Heavily throttled
+// so the channel doesn't get flooded by noisy RSS feeds:
+//   - only `impact = 'high'` items
+//   - only items published in the last 4 hours
+//   - max 3 per refresh cycle (oldest first within that window)
+//   - dedup'd via market_news.broadcast_at (set after a successful send)
+async function broadcastFreshNews() {
+  if (!pool) return 0;
+  let sent = 0;
+  try {
+    const r = await dbq(`
+      SELECT id, source, headline, url, published_at
+        FROM market_news
+       WHERE pair='XAUUSD'
+         AND impact='high'
+         AND broadcast_at IS NULL
+         AND published_at >= NOW() - INTERVAL '4 hours'
+       ORDER BY published_at ASC
+       LIMIT 3`);
+    for (const row of r.rows) {
+      const when = new Date(row.published_at);
+      const ago = Math.max(1, Math.round((Date.now() - when.getTime()) / 60000));
+      const msg =
+        `📰 MARKET NEWS (high impact)\n\n` +
+        `${row.headline}\n\n` +
+        `Source: ${row.source}\n` +
+        `Published: ${ago}m ago\n` +
+        `${row.url}`;
+      try {
+        await sendTelegramMessage(msg);
+        await dbq('UPDATE market_news SET broadcast_at = NOW() WHERE id = $1', [row.id]);
+        sent++;
+      } catch (e) {
+        console.warn('[news] tg broadcast failed:', e.message);
+        break; // stop the loop on TG failure to avoid burning quota
+      }
+    }
+  } catch (e) { console.warn('[news] broadcast query failed:', e.message); }
+  if (sent) console.log(`[news] broadcast ${sent} high-impact headline(s) to Telegram`);
+  return sent;
 }
 
 // (inlined — no module.exports)
@@ -2093,11 +2136,17 @@ if (HAS_DB) {
   // Wait for tables to exist before the first hit; the recurring intervals run
   // unconditionally afterwards (cheap no-ops if a query fails transiently).
   schemaReady.then(() => {
-    refreshNews(httpsGetText).catch((e) => console.warn('[news] initial fetch failed:', e.message));
+    refreshNews(httpsGetText)
+      .then(() => broadcastFreshNews())
+      .catch((e) => console.warn('[news] initial fetch failed:', e.message));
     cleanupOldTrades().catch(() => {});
     archiveMonthIfRolled().catch(() => {});
   });
-  setInterval(() => refreshNews(httpsGetText).catch(() => {}), 15 * 60 * 1000);
+  setInterval(() => {
+    refreshNews(httpsGetText)
+      .then(() => broadcastFreshNews())
+      .catch(() => {});
+  }, 15 * 60 * 1000);
   setInterval(() => {
     cleanupOldTrades().catch(() => {});
     archiveMonthIfRolled().catch(() => {});
@@ -2130,10 +2179,44 @@ const MARKET_BANNER = `
 @keyframes alfaPulse{0%,100%{opacity:1}50%{opacity:.35}}
 body.alfa-market-closed{padding-top:42px!important;
   transition:padding-top .15s ease}
+#alfa-news-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;
+  width:360px;max-width:calc(100vw - 32px);max-height:60vh;
+  background:#0f1421;border:1px solid #233047;border-radius:12px;
+  box-shadow:0 10px 40px rgba(0,0,0,.55);
+  font:13px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;color:#e8ecf3;
+  display:flex;flex-direction:column;overflow:hidden;
+  transform:translateY(0);transition:transform .2s ease,opacity .2s ease;opacity:1}
+#alfa-news-panel.alfa-collapsed{transform:translateY(calc(100% - 42px))}
+#alfa-news-head{display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px;background:#131a2b;border-bottom:1px solid #1c2438;cursor:pointer;user-select:none}
+#alfa-news-head .alfa-title{font-weight:700;letter-spacing:.4px;font-size:12px;text-transform:uppercase;color:#a78bfa}
+#alfa-news-head .alfa-title .alfa-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#a78bfa;margin-right:8px;vertical-align:middle}
+#alfa-news-head .alfa-toggle{color:#8a96ad;font-size:11px}
+#alfa-news-list{overflow-y:auto;padding:6px 0}
+#alfa-news-list .alfa-item{padding:10px 14px;border-bottom:1px solid #1a2236;display:block;text-decoration:none;color:inherit}
+#alfa-news-list .alfa-item:last-child{border-bottom:0}
+#alfa-news-list .alfa-item:hover{background:#141b2c}
+#alfa-news-list .alfa-headline{color:#e8ecf3;font-weight:500;margin-bottom:4px}
+#alfa-news-list .alfa-meta{color:#8a96ad;font-size:11px;display:flex;justify-content:space-between;gap:8px}
+#alfa-news-list .alfa-imp{padding:1px 7px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.alfa-imp-high{background:rgba(239,68,68,.18);color:#f87171}
+.alfa-imp-medium{background:rgba(234,179,8,.18);color:#fbbf24}
+.alfa-imp-low{background:rgba(148,163,184,.15);color:#94a3b8}
+#alfa-news-empty{padding:18px 14px;color:#8a96ad;text-align:center;font-size:12px}
+@media (max-width:520px){
+  #alfa-news-panel{right:8px;bottom:8px;left:8px;width:auto;max-height:55vh}
+}
 </style>
 <div id="alfa-market-banner" role="status" aria-live="polite">
   <span class="dot"></span><b>MARKET CLOSED</b>
   <span id="alfa-market-msg">XAU/USD is closed for the weekend. Auto-signals paused.</span>
+</div>
+<div id="alfa-news-panel" class="alfa-collapsed" aria-label="Market news">
+  <div id="alfa-news-head">
+    <span class="alfa-title"><span class="alfa-dot"></span>Market News <span id="alfa-news-count" style="color:#8a96ad;font-weight:500;margin-left:6px"></span></span>
+    <span class="alfa-toggle" id="alfa-news-toggle">Expand ▲</span>
+  </div>
+  <div id="alfa-news-list"><div id="alfa-news-empty">Loading…</div></div>
 </div>
 <script>(function(){
   var el=document.getElementById('alfa-market-banner');
@@ -2196,6 +2279,53 @@ body.alfa-market-closed{padding-top:42px!important;
     }).catch(function(){});
   }
   tick();setInterval(tick,15000);
+
+  // ---- News panel --------------------------------------------------------
+  var panel=document.getElementById('alfa-news-panel');
+  var head=document.getElementById('alfa-news-head');
+  var toggle=document.getElementById('alfa-news-toggle');
+  var list=document.getElementById('alfa-news-list');
+  var countEl=document.getElementById('alfa-news-count');
+  var STORAGE_KEY='alfaNewsCollapsed';
+  function applyCollapsed(c){
+    if(c){panel.classList.add('alfa-collapsed');toggle.textContent='Expand ▲';}
+    else{panel.classList.remove('alfa-collapsed');toggle.textContent='Hide ▼';}
+  }
+  try{applyCollapsed(localStorage.getItem(STORAGE_KEY)!=='0');}catch(e){applyCollapsed(true);}
+  head.addEventListener('click',function(){
+    var nowCollapsed=!panel.classList.contains('alfa-collapsed');
+    applyCollapsed(nowCollapsed);
+    try{localStorage.setItem(STORAGE_KEY,nowCollapsed?'1':'0');}catch(e){}
+  });
+  function timeAgo(iso){
+    var ms=Date.now()-new Date(iso).getTime();
+    var m=Math.round(ms/60000);
+    if(m<1) return 'just now';
+    if(m<60) return m+'m ago';
+    var h=Math.round(m/60);
+    if(h<24) return h+'h ago';
+    return Math.round(h/24)+'d ago';
+  }
+  function escapeHtml(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function renderNews(items){
+    if(!items||!items.length){list.innerHTML='<div id="alfa-news-empty">No headlines yet — refreshing every 15 min.</div>';countEl.textContent='';return;}
+    var high=items.filter(function(x){return x.impact==='high'}).length;
+    countEl.textContent='('+items.length+(high?' • '+high+' high':'')+')';
+    list.innerHTML=items.slice(0,15).map(function(x){
+      var imp=(x.impact||'low').toLowerCase();
+      return '<a class="alfa-item" href="'+escapeHtml(x.url)+'" target="_blank" rel="noopener">'+
+        '<div class="alfa-headline">'+escapeHtml(x.title)+'</div>'+
+        '<div class="alfa-meta"><span>'+escapeHtml(x.source||'')+' • '+timeAgo(x.publishedAt)+'</span>'+
+        '<span class="alfa-imp alfa-imp-'+imp+'">'+imp+'</span></div></a>';
+    }).join('');
+  }
+  function loadNews(){
+    fetch('/api/news/xauusd?limit=20',{cache:'no-store'})
+      .then(function(r){return r.json()})
+      .then(function(j){renderNews(j&&j.items||[]);})
+      .catch(function(){list.innerHTML='<div id="alfa-news-empty">Could not load news.</div>';});
+  }
+  loadNews();setInterval(loadNews,60000);
 })();</script>
 `;
 function injectBanner(html) {
